@@ -24,8 +24,9 @@ def _pattern_direction(pattern, base_pattern):
     (a different bay/platform, an extra depot or layover stop tacked onto one
     end, a time-of-day variant with a slightly different final stop, etc.).
     An exact-match test silently falls back to "same direction" whenever that
-    happens, which re-merges genuine return trips into direction 0 - the same
-    bug this whole function exists to avoid.
+    happens, which re-merges genuine return trips into direction 0 - this is
+    exactly what was causing two-direction bus lines (e.g. 860, 20) to lose
+    their return direction.
 
     Instead, we look only at the stops shared by both patterns and check
     whether they appear in increasing or decreasing order relative to
