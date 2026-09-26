@@ -12,6 +12,47 @@ DB_OUTPUT = os.path.join(
 RAIL_SHAPES = os.path.join(PROJECT_ROOT, "rail_shapes.geojson")
 
 
+def _pattern_direction(pattern, base_pattern):
+    """
+    Determines whether `pattern` runs the same way as `base_pattern` (0) or in
+    reverse (1), by comparing the relative order of the stops the two patterns
+    have in common.
+
+    This is deliberately NOT an exact-endpoint comparison (e.g.
+    `pattern[-1] == base_pattern[0]`). Real GTFS feeds frequently give the
+    return trip a different terminus stop_id than the outbound trip's origin
+    (a different bay/platform, an extra depot or layover stop tacked onto one
+    end, a time-of-day variant with a slightly different final stop, etc.).
+    An exact-match test silently falls back to "same direction" whenever that
+    happens, which re-merges genuine return trips into direction 0 - the same
+    bug this whole function exists to avoid.
+
+    Instead, we look only at the stops shared by both patterns and check
+    whether they appear in increasing or decreasing order relative to
+    base_pattern. True reverse-direction trips will have their shared stops
+    in decreasing order even if their exact endpoints differ; same-direction
+    variants (e.g. an express pattern skipping some stops) will have them in
+    increasing order.
+    """
+    base_index = {stop_id: i for i, stop_id in enumerate(base_pattern)}
+    common_positions = [base_index[s] for s in pattern if s in base_index]
+
+    if len(common_positions) < 2:
+        # Not enough shared stops to judge order from - fall back to a loose
+        # endpoint check rather than defaulting blindly to direction 0.
+        if pattern[-1] == base_pattern[0] or pattern[0] == base_pattern[-1]:
+            return 1
+        return 0
+
+    increasing = sum(
+        1 for a, b in zip(common_positions, common_positions[1:]) if b > a
+    )
+    decreasing = sum(
+        1 for a, b in zip(common_positions, common_positions[1:]) if b < a
+    )
+    return 1 if decreasing > increasing else 0
+
+
 def resolve_route_directions(trip_ids_by_route, trip_to_direction, trip_stops):
     """
     Maps trip_id -> direction_id (0 or 1), robust to GTFS feeds (e.g. OSY's bus
@@ -53,8 +94,10 @@ def resolve_route_directions(trip_ids_by_route, trip_to_direction, trip_stops):
         for tid in base_trips:
             resolved[tid] = 0
         for pattern, trips in ranked[1:]:
-            # Opposite-direction trips typically end where the base pattern starts.
-            direction = 1 if pattern[-1] == base_pattern[0] else 0
+            # Judge direction by whether shared stops run in the same order as
+            # the base pattern or in reverse - robust to trips whose terminus
+            # stop doesn't exactly match the base pattern's origin stop.
+            direction = _pattern_direction(pattern, base_pattern)
             for tid in trips:
                 resolved[tid] = direction
         for tid in trip_ids:
