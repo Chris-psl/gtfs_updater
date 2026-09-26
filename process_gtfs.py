@@ -12,6 +12,56 @@ DB_OUTPUT = os.path.join(
 RAIL_SHAPES = os.path.join(PROJECT_ROOT, "rail_shapes.geojson")
 
 
+def resolve_route_directions(trip_ids_by_route, trip_to_direction, trip_stops):
+    """
+    Maps trip_id -> direction_id (0 or 1), robust to GTFS feeds (e.g. OSY's bus
+    feed) where direction_id is blank or identical for every trip on a route.
+
+    When the raw GTFS field can't tell two real directions apart, the
+    "keep the longest trip per (route_id, direction_id)" logic below silently
+    drops whichever direction happens to have shorter trips — this is what
+    caused routes like line 20 to only ever show one way. Here, if a route's
+    raw direction_id never varies across its trips, direction is re-derived
+    from each trip's actual stop sequence instead.
+    """
+    resolved = {}
+    for route_id, trip_ids in trip_ids_by_route.items():
+        raw = {trip_to_direction.get(tid, 0) for tid in trip_ids}
+        if len(raw) > 1:
+            # The feed already distinguishes directions for this route - trust it.
+            for tid in trip_ids:
+                resolved[tid] = trip_to_direction.get(tid, 0)
+            continue
+
+        # Cluster trips by their exact stop-sequence pattern.
+        patterns = {}
+        for tid in trip_ids:
+            stops = trip_stops.get(tid)
+            if not stops:
+                continue
+            pattern = tuple(stop_id for _, stop_id in sorted(stops))
+            patterns.setdefault(pattern, []).append(tid)
+
+        if len(patterns) < 2:
+            # Genuinely only one pattern exists - one real direction.
+            for tid in trip_ids:
+                resolved[tid] = 0
+            continue
+
+        ranked = sorted(patterns.items(), key=lambda kv: -len(kv[1]))
+        base_pattern, base_trips = ranked[0]
+        for tid in base_trips:
+            resolved[tid] = 0
+        for pattern, trips in ranked[1:]:
+            # Opposite-direction trips typically end where the base pattern starts.
+            direction = 1 if pattern[-1] == base_pattern[0] else 0
+            for tid in trips:
+                resolved[tid] = direction
+        for tid in trip_ids:
+            resolved.setdefault(tid, 0)
+    return resolved
+
+
 def build_database():
     os.makedirs(os.path.dirname(DB_OUTPUT), exist_ok=True)
 
@@ -205,6 +255,19 @@ def build_database():
                         if trip_id not in trip_stops:
                             trip_stops[trip_id] = []
                         trip_stops[trip_id].append((seq, stop_id))
+
+            # Re-derive direction_id per route whenever the raw GTFS field is
+            # unreliable (blank/constant for every trip on that route). This is
+            # the fix for lines like 20 that were losing their return direction
+            # because both directions collapsed onto the same (route, 0) key.
+            trip_ids_by_route = {}
+            for trip_id in trip_stops:
+                route_id = trip_to_route.get(trip_id)
+                if route_id:
+                    trip_ids_by_route.setdefault(route_id, []).append(trip_id)
+            trip_to_direction = resolve_route_directions(
+                trip_ids_by_route, trip_to_direction, trip_stops
+            )
 
             # Κρατάμε το καλύτερο δρομολόγιο ΑΝΑ ΓΡΑΜΜΗ & ΚΑΤΕΥΘΥΝΣΗ (Πλέον δεν σβήνεται η επιστροφή)
             route_dir_best_trip = {}
