@@ -1,5 +1,6 @@
 import csv
 import json
+import math
 import os
 import sqlite3
 
@@ -12,98 +13,174 @@ DB_OUTPUT = os.path.join(
 RAIL_SHAPES = os.path.join(PROJECT_ROOT, "rail_shapes.geojson")
 
 
-def _pattern_direction(pattern, base_pattern):
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def _stop_latlon(stops_by_id, stop_id):
+    row = stops_by_id.get(stop_id)
+    if not row:
+        return None
+    try:
+        return float(row["stop_lat"]), float(row["stop_lon"])
+    except (TypeError, ValueError, KeyError):
+        return None
+
+
+def _bearing(lat1, lon1, lat2, lon2):
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dlon = math.radians(lon2 - lon1)
+    y = math.sin(dlon) * math.cos(phi2)
+    x = math.cos(phi1) * math.sin(phi2) - math.sin(phi1) * math.cos(phi2) * math.cos(dlon)
+    return (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
+
+
+def _angle_diff(a, b):
+    d = abs(a - b) % 360.0
+    return d if d <= 180.0 else 360.0 - d
+
+
+def _pattern_bearing(pattern, stops_by_id):
+    start = _stop_latlon(stops_by_id, pattern[0])
+    end = _stop_latlon(stops_by_id, pattern[-1])
+    if not start or not end or start == end:
+        return None
+    return _bearing(start[0], start[1], end[0], end[1])
+
+
+def _mode(values):
+    if not values:
+        return None
+    counts = {}
+    for v in values:
+        counts[v] = counts.get(v, 0) + 1
+    return max(counts.items(), key=lambda kv: kv[1])[0]
+
+
+# ---------------------------------------------------------------------------
+# Variant clustering
+#
+# A route can have far more than two physical patterns: a normal two-way bus
+# line, express/skip variants, a school-only detour, or - like the circular
+# 824 - a main loop plus a single once-a-day short-working from a different
+# square (Πλατεία Καραϊσκάκη). None of these should ever be dropped or
+# silently merged into another pattern just because it isn't the most common
+# one. Every distinct stop sequence with >= 2 stops becomes its own
+# "variant" and is kept in full; directionId is only ever a UI grouping
+# label (which tab a variant's PRIMARY sibling lives under), never a filter
+# that decides what data survives.
+# ---------------------------------------------------------------------------
+
+def _assign_direction(pattern, reference_pattern, reference_bearing, raw_directions, stops_by_id):
     """
-    Determines whether `pattern` runs the same way as `base_pattern` (0) or in
-    reverse (1), by comparing the relative order of the stops the two patterns
-    have in common.
-
-    This is deliberately NOT an exact-endpoint comparison (e.g.
-    `pattern[-1] == base_pattern[0]`). Real GTFS feeds frequently give the
-    return trip a different terminus stop_id than the outbound trip's origin
-    (a different bay/platform, an extra depot or layover stop tacked onto one
-    end, a time-of-day variant with a slightly different final stop, etc.).
-    An exact-match test silently falls back to "same direction" whenever that
-    happens, which re-merges genuine return trips into direction 0 - this is
-    exactly what was causing two-direction bus lines (e.g. 860, 20) to lose
-    their return direction.
-
-    Instead, we look only at the stops shared by both patterns and check
-    whether they appear in increasing or decreasing order relative to
-    base_pattern. True reverse-direction trips will have their shared stops
-    in decreasing order even if their exact endpoints differ; same-direction
-    variants (e.g. an express pattern skipping some stops) will have them in
-    increasing order.
+    Priority:
+      1. If every trip that shares this EXACT pattern agrees on a raw 0/1
+         GTFS direction_id, trust it - it only needs to be self-consistent
+         for this one pattern, not for the whole (possibly messy) feed.
+      2. Otherwise fall back to geography: compare the bearing from this
+         pattern's first stop to its last stop against the route's
+         dominant (most-used) pattern's bearing. This still works when the
+         two patterns share zero stops, unlike a stop-position comparison,
+         and is what keeps a low-overlap return trip out of the outbound
+         bucket instead of defaulting into it.
+      3. A genuine loop (first stop == last stop) with nothing to compare
+         bearings against is the route's single direction - 0.
     """
-    base_index = {stop_id: i for i, stop_id in enumerate(base_pattern)}
-    common_positions = [base_index[s] for s in pattern if s in base_index]
+    if raw_directions == {0} or raw_directions == {1}:
+        return next(iter(raw_directions))
 
-    if len(common_positions) < 2:
-        # Not enough shared stops to judge order from - fall back to a loose
-        # endpoint check rather than defaulting blindly to direction 0.
-        if pattern[-1] == base_pattern[0] or pattern[0] == base_pattern[-1]:
-            return 1
+    if pattern == reference_pattern:
         return 0
 
-    increasing = sum(
-        1 for a, b in zip(common_positions, common_positions[1:]) if b > a
-    )
-    decreasing = sum(
-        1 for a, b in zip(common_positions, common_positions[1:]) if b < a
-    )
-    return 1 if decreasing > increasing else 0
+    if pattern[0] == pattern[-1]:
+        return 0
+
+    bearing = _pattern_bearing(pattern, stops_by_id)
+    if bearing is None or reference_bearing is None:
+        # No usable geometry and it's a genuinely distinct pattern from the
+        # dominant one - safer to flag it as the other direction than to
+        # silently fold it into the main pattern's bucket.
+        return 1
+
+    return 1 if _angle_diff(bearing, reference_bearing) > 90.0 else 0
 
 
-def resolve_route_directions(trip_ids_by_route, trip_to_direction, trip_stops):
-    """
-    Maps trip_id -> direction_id (0 or 1), robust to GTFS feeds (e.g. OSY's bus
-    feed) where direction_id is blank or identical for every trip on a route.
-
-    When the raw GTFS field can't tell two real directions apart, the
-    "keep the longest trip per (route_id, direction_id)" logic below silently
-    drops whichever direction happens to have shorter trips — this is what
-    caused routes like line 20 to only ever show one way. Here, if a route's
-    raw direction_id never varies across its trips, direction is re-derived
-    from each trip's actual stop sequence instead.
-    """
-    resolved = {}
-    for route_id, trip_ids in trip_ids_by_route.items():
-        raw = {trip_to_direction.get(tid, 0) for tid in trip_ids}
-        if len(raw) > 1:
-            # The feed already distinguishes directions for this route - trust it.
-            for tid in trip_ids:
-                resolved[tid] = trip_to_direction.get(tid, 0)
+def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
+                          trip_to_headsign, trip_to_shape, stops_by_id):
+    patterns = {}  # pattern tuple -> [trip_id, ...]
+    for trip_id in trip_ids:
+        stops = trip_stops.get(trip_id)
+        if not stops or len(stops) < 2:
             continue
+        pattern = tuple(stop_id for _, stop_id in sorted(stops))
+        patterns.setdefault(pattern, []).append(trip_id)
 
-        # Cluster trips by their exact stop-sequence pattern.
-        patterns = {}
-        for tid in trip_ids:
-            stops = trip_stops.get(tid)
-            if not stops:
-                continue
-            pattern = tuple(stop_id for _, stop_id in sorted(stops))
-            patterns.setdefault(pattern, []).append(tid)
+    if not patterns:
+        return []
 
-        if len(patterns) < 2:
-            # Genuinely only one pattern exists - one real direction.
-            for tid in trip_ids:
-                resolved[tid] = 0
-            continue
+    reference_pattern = max(patterns, key=lambda p: len(patterns[p]))
+    reference_bearing = _pattern_bearing(reference_pattern, stops_by_id)
 
-        ranked = sorted(patterns.items(), key=lambda kv: -len(kv[1]))
-        base_pattern, base_trips = ranked[0]
-        for tid in base_trips:
-            resolved[tid] = 0
-        for pattern, trips in ranked[1:]:
-            # Judge direction by whether shared stops run in the same order as
-            # the base pattern or in reverse - robust to trips whose terminus
-            # stop doesn't exactly match the base pattern's origin stop.
-            direction = _pattern_direction(pattern, base_pattern)
-            for tid in trips:
-                resolved[tid] = direction
-        for tid in trip_ids:
-            resolved.setdefault(tid, 0)
-    return resolved
+    variants = []
+    for index, (pattern, trip_ids_in_pattern) in enumerate(
+        sorted(patterns.items(), key=lambda kv: -len(kv[1]))
+    ):
+        raw_directions = {trip_to_direction.get(tid) for tid in trip_ids_in_pattern}
+        raw_directions.discard(None)
+
+        direction_id = _assign_direction(
+            pattern, reference_pattern, reference_bearing, raw_directions, stops_by_id
+        )
+
+        shape_id = _mode(
+            [trip_to_shape.get(tid) for tid in trip_ids_in_pattern if trip_to_shape.get(tid)]
+        )
+        headsign = _mode(
+            [trip_to_headsign.get(tid) for tid in trip_ids_in_pattern if trip_to_headsign.get(tid)]
+        ) or (stops_by_id.get(pattern[-1], {}) or {}).get("stop_name", "")
+
+        variants.append({
+            "variant_id": f"{route_id}::v{index}",
+            "route_id": route_id,
+            "direction_id": direction_id,
+            "headsign": headsign,
+            "trip_count": len(trip_ids_in_pattern),
+            "stop_ids": pattern,
+            "shape_id": shape_id,
+        })
+
+    # The most-used variant per direction stays "primary" - it's what
+    # continues to drive the existing Outbound/Inbound tabs and the legacy
+    # route_stops/route_shapes tables the metro/tram background layer reads.
+    # Every other variant (rare detours, short-workings, express patterns)
+    # is still stored and still selectable - it's just not the default.
+    best_per_direction = {}
+    for variant in variants:
+        key = variant["direction_id"]
+        if key not in best_per_direction or variant["trip_count"] > best_per_direction[key]["trip_count"]:
+            best_per_direction[key] = variant
+    for variant in variants:
+        variant["is_primary"] = variant is best_per_direction[variant["direction_id"]]
+
+    return variants
+
+
+def _shape_or_stop_points(variant, shape_points, stops_by_id):
+    """Returns a list of (lat, lon) points to draw for a variant: the shape
+    if one exists with >= 2 points, otherwise the variant's own stops joined
+    in order - never another variant's or another trip's stops."""
+    shape_id = variant["shape_id"]
+    points = shape_points.get(shape_id) if shape_id else None
+    if points and len(points) >= 2:
+        sorted_pts = sorted(points, key=lambda x: x[0])
+        return [(lat, lon) for _, lat, lon in sorted_pts]
+
+    result = []
+    for stop_id in variant["stop_ids"]:
+        latlon = _stop_latlon(stops_by_id, stop_id)
+        if latlon:
+            result.append(latlon)
+    return result
 
 
 def build_database():
@@ -135,7 +212,10 @@ def build_database():
         )
     """)
 
-    # ΠΡΟΣΘΗΚΗ directionId
+    # Legacy "one path per (route, direction)" tables. Still populated -
+    # from each direction's PRIMARY variant - so the existing metro/tram
+    # background layer (MapLibreManager.loadAndRenderTransitLines) and the
+    # default Outbound/Inbound view keep working unchanged.
     cursor.execute("""
         CREATE TABLE route_stops (
             routeId TEXT NOT NULL,
@@ -146,7 +226,6 @@ def build_database():
         )
     """)
 
-    # ΠΡΟΣΘΗΚΗ directionId
     cursor.execute("""
         CREATE TABLE route_shapes (
             routeId TEXT NOT NULL,
@@ -155,6 +234,39 @@ def build_database():
             shapeLon REAL NOT NULL,
             shapeSequence INTEGER NOT NULL,
             PRIMARY KEY (routeId, directionId, shapeSequence)
+        )
+    """)
+
+    # New: every distinct physical pattern a route runs, kept in full.
+    cursor.execute("""
+        CREATE TABLE route_variants (
+            variantId TEXT PRIMARY KEY NOT NULL,
+            routeId TEXT NOT NULL,
+            directionId INTEGER NOT NULL,
+            headsign TEXT,
+            tripCount INTEGER NOT NULL,
+            isPrimary INTEGER NOT NULL
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE route_variant_stops (
+            variantId TEXT NOT NULL,
+            routeId TEXT NOT NULL,
+            stopId TEXT NOT NULL,
+            stopSequence INTEGER NOT NULL,
+            PRIMARY KEY (variantId, stopSequence)
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE route_variant_shapes (
+            variantId TEXT NOT NULL,
+            routeId TEXT NOT NULL,
+            shapeLat REAL NOT NULL,
+            shapeLon REAL NOT NULL,
+            shapeSequence INTEGER NOT NULL,
+            PRIMARY KEY (variantId, shapeSequence)
         )
     """)
 
@@ -168,7 +280,6 @@ def build_database():
         )
     """)
 
-    # ΠΡΟΣΘΗΚΗ directionId
     cursor.execute("""
         CREATE TABLE scheduled_arrivals (
             routeId TEXT NOT NULL,
@@ -186,6 +297,7 @@ def build_database():
         print(f"Processing {gtfs_dir}...")
 
         # 1. Routes
+        stops_by_id = {}
         routes_path = os.path.join(gtfs_dir, "routes.txt")
         if os.path.exists(routes_path):
             with open(routes_path, mode="r", encoding="utf-8-sig") as f:
@@ -259,8 +371,9 @@ def build_database():
                         "INSERT OR IGNORE INTO stops VALUES (?, ?, ?, ?, ?)",
                         (stop_id, stop_name, lat, lon, default_transport),
                     )
+                    stops_by_id[stop_id] = {"stop_name": stop_name, "stop_lat": lat, "stop_lon": lon}
 
-        # 3. Trips, Stop Times & Shapes
+        # 3. Trips
         trips_path = os.path.join(gtfs_dir, "trips.txt")
         stop_times_path = os.path.join(gtfs_dir, "stop_times.txt")
         shapes_path = os.path.join(gtfs_dir, "shapes.txt")
@@ -268,6 +381,7 @@ def build_database():
         trip_to_route = {}
         trip_to_shape = {}
         trip_to_direction = {}
+        trip_to_headsign = {}
         if os.path.exists(trips_path):
             with open(trips_path, mode="r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
@@ -276,16 +390,16 @@ def build_database():
                     route_id = row["route_id"].strip()
                     shape_id = row.get("shape_id", "").strip()
                     dir_str = row.get("direction_id", "").strip()
-                    direction_id = int(dir_str) if dir_str.isdigit() else 0
-                    
+
                     trip_to_route[trip_id] = route_id
-                    trip_to_direction[trip_id] = direction_id
+                    trip_to_direction[trip_id] = int(dir_str) if dir_str in ("0", "1") else None
+                    trip_to_headsign[trip_id] = row.get("trip_headsign", "").strip()
                     if shape_id:
                         trip_to_shape[trip_id] = shape_id
 
-        # Stop Times for route_stops (UI stop list)
+        # 4. Stop times -> per-trip stop sequences
+        trip_stops = {}
         if os.path.exists(stop_times_path):
-            trip_stops = {}
             with open(stop_times_path, mode="r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -296,49 +410,11 @@ def build_database():
                         except ValueError:
                             seq = 0
                         stop_id = row["stop_id"].strip()
-                        if trip_id not in trip_stops:
-                            trip_stops[trip_id] = []
-                        trip_stops[trip_id].append((seq, stop_id))
+                        trip_stops.setdefault(trip_id, []).append((seq, stop_id))
 
-            # Re-derive direction_id per route whenever the raw GTFS field is
-            # unreliable (blank/constant for every trip on that route). This is
-            # the fix for lines like 20 that were losing their return direction
-            # because both directions collapsed onto the same (route, 0) key.
-            trip_ids_by_route = {}
-            for trip_id in trip_stops:
-                route_id = trip_to_route.get(trip_id)
-                if route_id:
-                    trip_ids_by_route.setdefault(route_id, []).append(trip_id)
-            trip_to_direction = resolve_route_directions(
-                trip_ids_by_route, trip_to_direction, trip_stops
-            )
-
-            # Κρατάμε το καλύτερο δρομολόγιο ΑΝΑ ΓΡΑΜΜΗ & ΚΑΤΕΥΘΥΝΣΗ (Πλέον δεν σβήνεται η επιστροφή)
-            route_dir_best_trip = {}
-            for trip_id, stops_list in trip_stops.items():
-                route_id = trip_to_route.get(trip_id)
-                direction_id = trip_to_direction.get(trip_id, 0)
-                if route_id:
-                    key = (route_id, direction_id)
-                    if (
-                        key not in route_dir_best_trip
-                        or len(stops_list) > route_dir_best_trip[key][1]
-                    ):
-                        route_dir_best_trip[key] = (trip_id, len(stops_list))
-
-            batch_stops = set()
-            for (route_id, direction_id), (best_trip_id, _) in route_dir_best_trip.items():
-                sorted_stops = sorted(trip_stops[best_trip_id], key=lambda x: x[0])
-                for idx, (seq, stop_id) in enumerate(sorted_stops):
-                    batch_stops.add((route_id, direction_id, stop_id, idx))
-
-            cursor.executemany(
-                "INSERT OR IGNORE INTO route_stops VALUES (?, ?, ?, ?)", list(batch_stops)
-            )
-
-        # Shapes for route_shapes (High-resolution map rendering)
-        if os.path.exists(shapes_path) and trip_to_shape:
-            shape_points = {}
+        # 5. Shapes
+        shape_points = {}
+        if os.path.exists(shapes_path):
             with open(shapes_path, mode="r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
@@ -349,63 +425,96 @@ def build_database():
                         seq = int(row["shape_pt_sequence"])
                     except (ValueError, TypeError):
                         continue
-                    if shape_id not in shape_points:
-                        shape_points[shape_id] = []
-                    shape_points[shape_id].append((seq, lat, lon))
+                    shape_points.setdefault(shape_id, []).append((seq, lat, lon))
 
-            route_dir_best_shape = {}
-            for (route_id, direction_id), (best_trip_id, _) in route_dir_best_trip.items():
-                shape_id = trip_to_shape.get(best_trip_id)
-                if shape_id in shape_points:
-                    route_dir_best_shape[(route_id, direction_id)] = (shape_id, len(shape_points[shape_id]))
+        if not trip_stops:
+            continue
 
-            batch_shapes = []
-            for (route_id, direction_id), (best_shape_id, _) in route_dir_best_shape.items():
-                sorted_pts = sorted(shape_points[best_shape_id], key=lambda x: x[0])
-                for idx, (seq, lat, lon) in enumerate(sorted_pts):
-                    batch_shapes.append((route_id, direction_id, lat, lon, idx))
+        # 6. Cluster every route's trips into variants
+        trip_ids_by_route = {}
+        for trip_id in trip_stops:
+            route_id = trip_to_route.get(trip_id)
+            if route_id:
+                trip_ids_by_route.setdefault(route_id, []).append(trip_id)
 
-            # Αν δεν υπάρχει επίσημο shape, σχεδιάζουμε γραμμή ενώνοντας τις στάσεις
-            for (route_id, direction_id), (best_trip_id, _) in route_dir_best_trip.items():
-                if (route_id, direction_id) in route_dir_best_shape:
+        variants_by_route = {}
+        for route_id, trip_ids in trip_ids_by_route.items():
+            variants_by_route[route_id] = build_route_variants(
+                route_id, trip_ids, trip_to_direction, trip_stops,
+                trip_to_headsign, trip_to_shape, stops_by_id
+            )
+
+        # 7. Insert variants + their stops/shapes, and mirror primaries into
+        #    the legacy route_stops/route_shapes tables.
+        batch_variants = []
+        batch_variant_stops = []
+        batch_variant_shapes = []
+        batch_legacy_stops = set()
+        batch_legacy_shapes = []
+        pattern_to_variant = {}
+
+        for route_id, variants in variants_by_route.items():
+            for variant in variants:
+                pattern_to_variant[(route_id, variant["stop_ids"])] = variant
+
+                batch_variants.append((
+                    variant["variant_id"], route_id, variant["direction_id"],
+                    variant["headsign"], variant["trip_count"],
+                    1 if variant["is_primary"] else 0,
+                ))
+
+                for idx, stop_id in enumerate(variant["stop_ids"]):
+                    batch_variant_stops.append((variant["variant_id"], route_id, stop_id, idx))
+
+                points = _shape_or_stop_points(variant, shape_points, stops_by_id)
+                for idx, (lat, lon) in enumerate(points):
+                    batch_variant_shapes.append((variant["variant_id"], route_id, lat, lon, idx))
+
+                if variant["is_primary"]:
+                    for idx, stop_id in enumerate(variant["stop_ids"]):
+                        batch_legacy_stops.add((route_id, variant["direction_id"], stop_id, idx))
+                    for idx, (lat, lon) in enumerate(points):
+                        batch_legacy_shapes.append((route_id, variant["direction_id"], lat, lon, idx))
+
+        cursor.executemany("INSERT OR IGNORE INTO route_variants VALUES (?, ?, ?, ?, ?, ?)", batch_variants)
+        cursor.executemany("INSERT OR IGNORE INTO route_variant_stops VALUES (?, ?, ?, ?)", batch_variant_stops)
+        cursor.executemany("INSERT OR IGNORE INTO route_variant_shapes VALUES (?, ?, ?, ?, ?)", batch_variant_shapes)
+        cursor.executemany("INSERT OR IGNORE INTO route_stops VALUES (?, ?, ?, ?)", list(batch_legacy_stops))
+        cursor.executemany("INSERT OR IGNORE INTO route_shapes VALUES (?, ?, ?, ?, ?)", batch_legacy_shapes)
+
+        # 8. Scheduled arrivals - attributed via each trip's OWN exact
+        #    pattern -> variant -> directionId, so every arrival lands under
+        #    the direction its trip actually belongs to (fixes the old
+        #    resolve_route_directions mis-attribution) instead of a single
+        #    per-route heuristic.
+        scheduled_arrivals = []
+        with open(stop_times_path, mode="r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                trip_id = row.get("trip_id", "").strip()
+                route_id = trip_to_route.get(trip_id)
+                stop_id = row.get("stop_id", "").strip()
+                raw_time = row.get("arrival_time", "").strip()
+                if not route_id or not stop_id or not raw_time:
                     continue
-                sorted_stops = sorted(trip_stops[best_trip_id], key=lambda x: x[0])
-                for idx, (_, stop_id) in enumerate(sorted_stops):
-                    stop = cursor.execute(
-                        "SELECT stopLat, stopLon FROM stops WHERE stopId = ?", (stop_id,)
-                    ).fetchone()
-                    if stop:
-                        batch_shapes.append((route_id, direction_id, stop[0], stop[1], idx))
+                stops_for_trip = trip_stops.get(trip_id)
+                if not stops_for_trip:
+                    continue
+                pattern = tuple(s for _, s in sorted(stops_for_trip))
+                variant = pattern_to_variant.get((route_id, pattern))
+                direction_id = variant["direction_id"] if variant else 0
+                try:
+                    hours, minutes, seconds = (int(part) for part in raw_time.split(":"))
+                    arrival_seconds = hours * 3600 + minutes * 60 + seconds
+                except (ValueError, TypeError):
+                    continue
+                scheduled_arrivals.append((route_id, direction_id, stop_id, arrival_seconds))
+        cursor.executemany(
+            "INSERT OR IGNORE INTO scheduled_arrivals VALUES (?, ?, ?, ?)",
+            scheduled_arrivals,
+        )
 
-            cursor.executemany(
-                "INSERT OR IGNORE INTO route_shapes VALUES (?, ?, ?, ?, ?)", batch_shapes
-            )
-
-        # Προγραμματισμένες αφίξεις
-        if os.path.exists(stop_times_path):
-            scheduled_arrivals = []
-            with open(stop_times_path, mode="r", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    trip_id = row.get("trip_id", "").strip()
-                    route_id = trip_to_route.get(trip_id)
-                    direction_id = trip_to_direction.get(trip_id, 0)
-                    stop_id = row.get("stop_id", "").strip()
-                    raw_time = row.get("arrival_time", "").strip()
-                    if not route_id or not stop_id or not raw_time:
-                        continue
-                    try:
-                        hours, minutes, seconds = (int(part) for part in raw_time.split(":"))
-                        arrival_seconds = hours * 3600 + minutes * 60 + seconds
-                    except (ValueError, TypeError):
-                        continue
-                    scheduled_arrivals.append((route_id, direction_id, stop_id, arrival_seconds))
-            cursor.executemany(
-                "INSERT OR IGNORE INTO scheduled_arrivals VALUES (?, ?, ?, ?)",
-                scheduled_arrivals,
-            )
-
-    # GEOJSON Override
+    # GEOJSON Override (unchanged - still targets the legacy route_shapes table)
     if os.path.exists(RAIL_SHAPES):
         with open(RAIL_SHAPES, mode="r", encoding="utf-8") as f:
             rail_shapes = json.load(f).get("features", [])
@@ -414,32 +523,31 @@ def build_database():
             row[0]: row[1]
             for row in cursor.execute("SELECT routeShortName, routeId FROM routes")
         }
-        
+
         lines_geojson = {}
         for feature in rail_shapes:
             properties = feature.get("properties", {})
             line_name = properties.get("line")
             geom_type = feature.get("geometry", {}).get("type")
             coords = feature.get("geometry", {}).get("coordinates", [])
-            
+
             if properties.get("mode") != "tram" or not line_name or not coords:
                 continue
-                
+
             if geom_type == "LineString":
                 lines_geojson.setdefault(line_name, []).append(coords)
             elif geom_type == "MultiLineString":
                 for line_coords in coords:
                     lines_geojson.setdefault(line_name, []).append(line_coords)
 
-        # Αν το GeoJSON έχει δύο (ή παραπάνω) lines για μία διαδρομή, τις αναθέτουμε σε direction 0 και 1
         for line_name, shapes_list in lines_geojson.items():
             route_id = routes_by_name.get(line_name)
             if not route_id:
                 continue
-            
+
             shapes_list.sort(key=len, reverse=True)
             cursor.execute("DELETE FROM route_shapes WHERE routeId = ?", (route_id,))
-            
+
             for direction_id, coordinates in enumerate(shapes_list[:2]):
                 cursor.executemany(
                     "INSERT OR IGNORE INTO route_shapes VALUES (?, ?, ?, ?, ?)",
@@ -459,7 +567,7 @@ def build_database():
 
     conn.commit()
     conn.close()
-    print("Database successfully built with routes, stops, and shapes (both directions)!")
+    print("Database successfully built with routes, stops, shapes and full variant coverage!")
 
 
 if __name__ == "__main__":
