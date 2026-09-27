@@ -58,14 +58,93 @@ def _mode(values):
 
 
 # ---------------------------------------------------------------------------
+# Route canonicalization
+#
+# GTFS publishers (OSY included) sometimes split ONE physical line into
+# several route_id records instead of several trip patterns under a single
+# record - e.g. base "860" (route_id 1014) plus a separate "860 (from Nea
+# Smyrni - Schools)" record (route_id 1761), or 824's main loop plus its
+# Plateia Karaiskaki short-working as its own route_id. Left alone, each
+# becomes a fully separate "line" in the app that happens to share a
+# display number - selecting "860" then only ever shows whichever record a
+# query happens to return, and the other one's stops/shape look "missing".
+#
+# This groups raw route_id records by route_short_name (the number a rider
+# actually recognizes) and picks whichever has the most trips as the
+# canonical id everything downstream - variants, stops, shapes, favorites,
+# scheduled_arrivals - is keyed under. The absorbed raw ids are preserved in
+# route_source_ids so anything that needs to map back to the original GTFS
+# ids (e.g. matching a real-time feed) still can.
+# ---------------------------------------------------------------------------
+
+def canonicalize_routes(raw_routes, trip_to_route):
+    trip_counts = {}
+    for route_id in trip_to_route.values():
+        trip_counts[route_id] = trip_counts.get(route_id, 0) + 1
+
+    by_short_name = {}
+    for route_id, row in raw_routes.items():
+        short_name = row.get("route_short_name", "").strip()
+        by_short_name.setdefault(short_name, []).append(route_id)
+
+    canonical_of = {}
+    groups = {}
+    for short_name, route_ids in by_short_name.items():
+        ordered = sorted(route_ids)
+        canonical = max(ordered, key=lambda rid: trip_counts.get(rid, 0))
+        groups[canonical] = ordered
+        for rid in route_ids:
+            canonical_of[rid] = canonical
+
+    return canonical_of, groups
+
+
+def classify_route(row, gtfs_dir, short_name, long_name):
+    raw_type = row.get("route_type", "3")
+    if raw_type == "1" or "subway" in gtfs_dir.lower():
+        transport_type = "METRO"
+    elif raw_type == "0" or "stasy" in gtfs_dir.lower():
+        transport_type = "TRAM"
+    elif "proastiakos" in gtfs_dir.lower():
+        transport_type = "SUBURBAN"
+    elif (
+        raw_type in ["0", "2", "4"]
+        or "TRAM" in short_name.upper()
+        or "ΤΡΑΜ" in long_name.upper()
+    ):
+        transport_type = "TRAM"
+    else:
+        transport_type = "BUS"
+
+    route_color = row.get("route_color", "").strip()
+    if not route_color or len(route_color) != 6:
+        if transport_type == "METRO":
+            if "1" in short_name or "ISAP" in long_name.upper():
+                route_color = "00A859"
+            elif "2" in short_name:
+                route_color = "DA291C"
+            else:
+                route_color = "00539F"
+        elif transport_type == "TRAM":
+            route_color = "E91E63"
+        else:
+            route_color = "0A58CA"
+
+    if transport_type == "TRAM":
+        route_color = "E91E63"
+
+    return transport_type, "#" + route_color
+
+
+# ---------------------------------------------------------------------------
 # Variant clustering
 #
-# A route can have far more than two physical patterns: a normal two-way bus
-# line, express/skip variants, a school-only detour, or - like the circular
-# 824 - a main loop plus a single once-a-day short-working from a different
-# square (Πλατεία Καραϊσκάκη). None of these should ever be dropped or
-# silently merged into another pattern just because it isn't the most common
-# one. Every distinct stop sequence with >= 2 stops becomes its own
+# A route (after canonicalization, above) can still have far more than two
+# physical patterns: a normal two-way bus line, express/skip variants, a
+# school-only detour, or - like the circular 824 - a main loop plus a
+# single once-a-day short-working. None of these should ever be dropped or
+# silently merged into another pattern just because it isn't the most
+# common one. Every distinct stop sequence with >= 2 stops becomes its own
 # "variant" and is kept in full; directionId is only ever a UI grouping
 # label (which tab a variant's PRIMARY sibling lives under), never a filter
 # that decides what data survives.
@@ -97,9 +176,6 @@ def _assign_direction(pattern, reference_pattern, reference_bearing, raw_directi
 
     bearing = _pattern_bearing(pattern, stops_by_id)
     if bearing is None or reference_bearing is None:
-        # No usable geometry and it's a genuinely distinct pattern from the
-        # dominant one - safer to flag it as the other direction than to
-        # silently fold it into the main pattern's bucket.
         return 1
 
     return 1 if _angle_diff(bearing, reference_bearing) > 90.0 else 0
@@ -149,11 +225,6 @@ def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
             "shape_id": shape_id,
         })
 
-    # The most-used variant per direction stays "primary" - it's what
-    # continues to drive the existing Outbound/Inbound tabs and the legacy
-    # route_stops/route_shapes tables the metro/tram background layer reads.
-    # Every other variant (rare detours, short-workings, express patterns)
-    # is still stored and still selectable - it's just not the default.
     best_per_direction = {}
     for variant in variants:
         key = variant["direction_id"]
@@ -166,9 +237,6 @@ def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
 
 
 def _shape_or_stop_points(variant, shape_points, stops_by_id):
-    """Returns a list of (lat, lon) points to draw for a variant: the shape
-    if one exists with >= 2 points, otherwise the variant's own stops joined
-    in order - never another variant's or another trip's stops."""
     shape_id = variant["shape_id"]
     points = shape_points.get(shape_id) if shape_id else None
     if points and len(points) >= 2:
@@ -212,10 +280,20 @@ def build_database():
         )
     """)
 
+    # Which raw GTFS route_id(s) a canonical routeId absorbed - e.g. 860's
+    # canonical id maps back to both 1014 (normal) and 1761 (school-hours).
+    cursor.execute("""
+        CREATE TABLE route_source_ids (
+            routeId TEXT NOT NULL,
+            sourceRouteId TEXT NOT NULL,
+            PRIMARY KEY (routeId, sourceRouteId)
+        )
+    """)
+
     # Legacy "one path per (route, direction)" tables. Still populated -
     # from each direction's PRIMARY variant - so the existing metro/tram
-    # background layer (MapLibreManager.loadAndRenderTransitLines) and the
-    # default Outbound/Inbound view keep working unchanged.
+    # background layer and the default Outbound/Inbound view keep working
+    # unchanged.
     cursor.execute("""
         CREATE TABLE route_stops (
             routeId TEXT NOT NULL,
@@ -237,7 +315,7 @@ def build_database():
         )
     """)
 
-    # New: every distinct physical pattern a route runs, kept in full.
+    # Every distinct physical pattern a (canonicalized) route runs, kept in full.
     cursor.execute("""
         CREATE TABLE route_variants (
             variantId TEXT PRIMARY KEY NOT NULL,
@@ -296,58 +374,8 @@ def build_database():
 
         print(f"Processing {gtfs_dir}...")
 
-        # 1. Routes
+        # 1. Stops (unaffected by route canonicalization)
         stops_by_id = {}
-        routes_path = os.path.join(gtfs_dir, "routes.txt")
-        if os.path.exists(routes_path):
-            with open(routes_path, mode="r", encoding="utf-8-sig") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    route_id = row["route_id"].strip()
-                    short_name = row.get("route_short_name", "").strip()
-                    long_name = row.get("route_long_name", "").strip()
-
-                    raw_type = row.get("route_type", "3")
-                    if raw_type == "1" or "subway" in gtfs_dir.lower():
-                        transport_type = "METRO"
-                    elif raw_type == "0" or "stasy" in gtfs_dir.lower():
-                        transport_type = "TRAM"
-                    elif "proastiakos" in gtfs_dir.lower():
-                        transport_type = "SUBURBAN"
-                    elif (
-                        raw_type in ["0", "2", "4"]
-                        or "TRAM" in short_name.upper()
-                        or "ΤΡΑΜ" in long_name.upper()
-                    ):
-                        transport_type = "TRAM"
-                    else:
-                        transport_type = "BUS"
-
-                    route_color = row.get("route_color", "").strip()
-                    if not route_color or len(route_color) != 6:
-                        if transport_type == "METRO":
-                            if "1" in short_name or "ISAP" in long_name.upper():
-                                route_color = "00A859"
-                            elif "2" in short_name:
-                                route_color = "DA291C"
-                            else:
-                                route_color = "00539F"
-                        elif transport_type == "TRAM":
-                            route_color = "E91E63"
-                        else:
-                            route_color = "0A58CA"
-
-                    if transport_type == "TRAM":
-                        route_color = "E91E63"
-
-                    route_color = "#" + route_color
-
-                    cursor.execute(
-                        "INSERT OR IGNORE INTO routes VALUES (?, ?, ?, ?, ?)",
-                        (route_id, short_name, long_name, transport_type, route_color),
-                    )
-
-        # 2. Stops
         stops_path = os.path.join(gtfs_dir, "stops.txt")
         if os.path.exists(stops_path):
             with open(stops_path, mode="r", encoding="utf-8-sig") as f:
@@ -373,15 +401,22 @@ def build_database():
                     )
                     stops_by_id[stop_id] = {"stop_name": stop_name, "stop_lat": lat, "stop_lon": lon}
 
-        # 3. Trips
-        trips_path = os.path.join(gtfs_dir, "trips.txt")
-        stop_times_path = os.path.join(gtfs_dir, "stop_times.txt")
-        shapes_path = os.path.join(gtfs_dir, "shapes.txt")
+        # 2. Raw routes - NOT inserted yet, we need trip counts first to
+        #    canonicalize any route_short_name shared by multiple route_ids.
+        raw_routes = {}
+        routes_path = os.path.join(gtfs_dir, "routes.txt")
+        if os.path.exists(routes_path):
+            with open(routes_path, mode="r", encoding="utf-8-sig") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    raw_routes[row["route_id"].strip()] = row
 
-        trip_to_route = {}
+        # 3. Raw trips, keyed by their ORIGINAL (not yet canonicalized) route_id
+        trip_to_raw_route = {}
         trip_to_shape = {}
         trip_to_direction = {}
         trip_to_headsign = {}
+        trips_path = os.path.join(gtfs_dir, "trips.txt")
         if os.path.exists(trips_path):
             with open(trips_path, mode="r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
@@ -391,7 +426,7 @@ def build_database():
                     shape_id = row.get("shape_id", "").strip()
                     dir_str = row.get("direction_id", "").strip()
 
-                    trip_to_route[trip_id] = route_id
+                    trip_to_raw_route[trip_id] = route_id
                     trip_to_direction[trip_id] = int(dir_str) if dir_str in ("0", "1") else None
                     trip_to_headsign[trip_id] = row.get("trip_headsign", "").strip()
                     if shape_id:
@@ -399,12 +434,13 @@ def build_database():
 
         # 4. Stop times -> per-trip stop sequences
         trip_stops = {}
+        stop_times_path = os.path.join(gtfs_dir, "stop_times.txt")
         if os.path.exists(stop_times_path):
             with open(stop_times_path, mode="r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     trip_id = row["trip_id"].strip()
-                    if trip_id in trip_to_route:
+                    if trip_id in trip_to_raw_route:
                         try:
                             seq = int(row["stop_sequence"])
                         except ValueError:
@@ -414,6 +450,7 @@ def build_database():
 
         # 5. Shapes
         shape_points = {}
+        shapes_path = os.path.join(gtfs_dir, "shapes.txt")
         if os.path.exists(shapes_path):
             with open(shapes_path, mode="r", encoding="utf-8-sig") as f:
                 reader = csv.DictReader(f)
@@ -427,10 +464,41 @@ def build_database():
                         continue
                     shape_points.setdefault(shape_id, []).append((seq, lat, lon))
 
-        if not trip_stops:
+        if not trip_stops or not raw_routes:
             continue
 
-        # 6. Cluster every route's trips into variants
+        # 6. Canonicalize: merge any route_ids sharing a route_short_name
+        #    (e.g. 860's normal + school-hours records) into one line id.
+        canonical_of, groups = canonicalize_routes(raw_routes, trip_to_raw_route)
+        trip_to_route = {
+            trip_id: canonical_of.get(raw_id, raw_id)
+            for trip_id, raw_id in trip_to_raw_route.items()
+        }
+
+        merged = {canonical: ids for canonical, ids in groups.items() if len(ids) > 1}
+        if merged:
+            print(f"  Merged {len(merged)} line(s) split across multiple GTFS route_ids:")
+            for canonical, ids in merged.items():
+                short = raw_routes[canonical].get("route_short_name", "").strip()
+                print(f"    {short}: {ids} -> {canonical}")
+
+        # 7. Insert routes + route_source_ids, one row per canonical line
+        batch_source_ids = []
+        for canonical, source_ids in groups.items():
+            row = raw_routes[canonical]
+            short_name = row.get("route_short_name", "").strip()
+            long_name = row.get("route_long_name", "").strip()
+            transport_type, route_color = classify_route(row, gtfs_dir, short_name, long_name)
+
+            cursor.execute(
+                "INSERT OR IGNORE INTO routes VALUES (?, ?, ?, ?, ?)",
+                (canonical, short_name, long_name, transport_type, route_color),
+            )
+            for source_id in source_ids:
+                batch_source_ids.append((canonical, source_id))
+        cursor.executemany("INSERT OR IGNORE INTO route_source_ids VALUES (?, ?)", batch_source_ids)
+
+        # 8. Cluster every (canonicalized) route's trips into variants
         trip_ids_by_route = {}
         for trip_id in trip_stops:
             route_id = trip_to_route.get(trip_id)
@@ -444,7 +512,7 @@ def build_database():
                 trip_to_headsign, trip_to_shape, stops_by_id
             )
 
-        # 7. Insert variants + their stops/shapes, and mirror primaries into
+        # 9. Insert variants + their stops/shapes, and mirror primaries into
         #    the legacy route_stops/route_shapes tables.
         batch_variants = []
         batch_variant_stops = []
@@ -482,11 +550,8 @@ def build_database():
         cursor.executemany("INSERT OR IGNORE INTO route_stops VALUES (?, ?, ?, ?)", list(batch_legacy_stops))
         cursor.executemany("INSERT OR IGNORE INTO route_shapes VALUES (?, ?, ?, ?, ?)", batch_legacy_shapes)
 
-        # 8. Scheduled arrivals - attributed via each trip's OWN exact
-        #    pattern -> variant -> directionId, so every arrival lands under
-        #    the direction its trip actually belongs to (fixes the old
-        #    resolve_route_directions mis-attribution) instead of a single
-        #    per-route heuristic.
+        # 10. Scheduled arrivals - attributed via each trip's OWN exact
+        #     pattern -> variant -> directionId, under the CANONICAL route id.
         scheduled_arrivals = []
         with open(stop_times_path, mode="r", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
