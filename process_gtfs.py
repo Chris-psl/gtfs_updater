@@ -179,9 +179,10 @@ def _assign_direction(pattern, reference_pattern, reference_bearing, reference_d
                        raw_directions, stops_by_id):
     """
     Priority:
-      1. If every trip that shares this EXACT pattern agrees on a raw 0/1
-         GTFS direction_id, trust it - it only needs to be self-consistent
-         for this one pattern, not for the whole (possibly messy) feed.
+      1. If this route's raw GTFS direction_id data is trustworthy (the
+         route uses BOTH 0 and 1 somewhere - see trust_raw_direction in
+         build_route_variants) and every trip sharing this EXACT pattern
+         agrees on a value, trust it.
       2. Otherwise fall back to geography: compare the bearing from this
          pattern's first stop to its last stop against the route's
          dominant (most-used) pattern's bearing, and land on whichever
@@ -190,13 +191,10 @@ def _assign_direction(pattern, reference_pattern, reference_bearing, reference_d
          IMPORTANT: this must be relative to the reference pattern's own
          ACTUAL assigned direction (reference_direction), not a hardcoded
          0 - the reference pattern's direction is itself decided by
-         priority 1 above and can just as easily resolve to 1 as 0
-         depending on what the feed's raw direction_id says. Hardcoding
-         "similar bearing -> 0" used to silently flip every pattern that
-         needed the geometric fallback whenever the reference pattern's
-         raw direction happened to be 1, which misbucketed rare/messy
-         patterns into the wrong direction (or duplicated a direction's
-         primary while leaving another pattern orphaned).
+         priority 1 above and can just as easily resolve to 1 as 0.
+         Hardcoding "similar bearing -> 0" used to silently flip every
+         pattern that needed the geometric fallback whenever the
+         reference pattern's raw direction happened to be 1.
       3. A genuine loop (first stop == last stop) with nothing to compare
          bearings against shares the reference pattern's direction.
     """
@@ -234,13 +232,31 @@ def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
     reference_pattern = max(patterns, key=lambda p: len(patterns[p]))
     reference_bearing = _pattern_bearing(reference_pattern, stops_by_id)
 
+    # Whether this route's raw GTFS direction_id field is actually
+    # meaningful. Some feeds (OSY among them) set direction_id to a single
+    # constant value - almost always 0 - on EVERY trip of EVERY pattern,
+    # rather than leaving it blank. Trusting "all trips in THIS pattern
+    # agree" (the per-pattern check below) then trivially succeeds for
+    # both the true outbound pattern and the true inbound pattern, since
+    # both only ever see 0 - forcing every pattern on the route into
+    # direction 0 and never reaching the geometric fallback that would
+    # have told them apart by bearing. Only trust raw direction_id at all
+    # if the route's OWN trips actually use more than one distinct value
+    # somewhere; otherwise the field carries no information for this
+    # route and every pattern falls through to geometry instead.
+    route_wide_directions = {trip_to_direction.get(tid) for tid in trip_ids}
+    route_wide_directions.discard(None)
+    trust_raw_direction = route_wide_directions == {0, 1}
+
     # The reference pattern's OWN direction, decided the same way as any
-    # other pattern's priority-1 case: trust its raw GTFS direction_id if
-    # every trip sharing it agrees, otherwise default to 0. Every other
-    # pattern that needs the geometric fallback in _assign_direction is
-    # bucketed relative to THIS value, not a hardcoded 0.
-    reference_raw_directions = {trip_to_direction.get(tid) for tid in patterns[reference_pattern]}
-    reference_raw_directions.discard(None)
+    # other pattern's priority-1 case (only when raw direction data is
+    # trustworthy for this route - see above). Every other pattern that
+    # needs the geometric fallback in _assign_direction is bucketed
+    # relative to THIS value, not a hardcoded 0.
+    reference_raw_directions = set()
+    if trust_raw_direction:
+        reference_raw_directions = {trip_to_direction.get(tid) for tid in patterns[reference_pattern]}
+        reference_raw_directions.discard(None)
     reference_direction = (
         next(iter(reference_raw_directions))
         if reference_raw_directions in ({0}, {1})
@@ -251,8 +267,10 @@ def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
     for index, (pattern, trip_ids_in_pattern) in enumerate(
         sorted(patterns.items(), key=lambda kv: -len(kv[1]))
     ):
-        raw_directions = {trip_to_direction.get(tid) for tid in trip_ids_in_pattern}
-        raw_directions.discard(None)
+        raw_directions = set()
+        if trust_raw_direction:
+            raw_directions = {trip_to_direction.get(tid) for tid in trip_ids_in_pattern}
+            raw_directions.discard(None)
 
         direction_id = _assign_direction(
             pattern, reference_pattern, reference_bearing, reference_direction,
