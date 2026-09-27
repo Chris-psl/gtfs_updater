@@ -107,14 +107,30 @@ def canonicalize_routes(raw_routes, trip_to_route):
     for route_id in trip_to_route.values():
         trip_counts[route_id] = trip_counts.get(route_id, 0) + 1
 
+    # Group by a NORMALIZED short_name rather than an exact string match.
+    # Some feeds record what is really the same physical line with
+    # slightly different route_short_name formatting across its separate
+    # route_id records - stray leading/trailing whitespace, doubled
+    # internal spaces, or inconsistent case (e.g. 824's main loop as
+    # "824" and its Plateia Karaiskaki short-working as "824 " or
+    # "  824"). An exact match here silently treats those as two
+    # unrelated lines: the short-working becomes its own separate route
+    # that never shows up as a variant of the line riders actually search
+    # for by number. Only the grouping KEY is normalized - the row
+    # actually inserted into the routes table below still uses the
+    # canonical record's own original (un-normalized) short_name/long_name
+    # for display.
+    def _normalize_short_name(name):
+        return " ".join(name.split()).upper()
+
     by_short_name = {}
     for route_id, row in raw_routes.items():
         short_name = row.get("route_short_name", "").strip()
-        by_short_name.setdefault(short_name, []).append(route_id)
+        by_short_name.setdefault(_normalize_short_name(short_name), []).append(route_id)
 
     canonical_of = {}
     groups = {}
-    for short_name, route_ids in by_short_name.items():
+    for _, route_ids in by_short_name.items():
         ordered = sorted(route_ids)
         canonical = max(ordered, key=lambda rid: trip_counts.get(rid, 0))
         groups[canonical] = ordered
