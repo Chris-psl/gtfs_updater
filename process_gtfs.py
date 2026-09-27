@@ -175,7 +175,8 @@ def classify_route(row, gtfs_dir, short_name, long_name):
 # that decides what data survives.
 # ---------------------------------------------------------------------------
 
-def _assign_direction(pattern, reference_pattern, reference_bearing, raw_directions, stops_by_id):
+def _assign_direction(pattern, reference_pattern, reference_bearing, reference_direction,
+                       raw_directions, stops_by_id):
     """
     Priority:
       1. If every trip that shares this EXACT pattern agrees on a raw 0/1
@@ -183,27 +184,38 @@ def _assign_direction(pattern, reference_pattern, reference_bearing, raw_directi
          for this one pattern, not for the whole (possibly messy) feed.
       2. Otherwise fall back to geography: compare the bearing from this
          pattern's first stop to its last stop against the route's
-         dominant (most-used) pattern's bearing. This still works when the
-         two patterns share zero stops, unlike a stop-position comparison,
-         and is what keeps a low-overlap return trip out of the outbound
-         bucket instead of defaulting into it.
+         dominant (most-used) pattern's bearing, and land on whichever
+         side of [reference_direction, 1 - reference_direction] that
+         comparison points to.
+         IMPORTANT: this must be relative to the reference pattern's own
+         ACTUAL assigned direction (reference_direction), not a hardcoded
+         0 - the reference pattern's direction is itself decided by
+         priority 1 above and can just as easily resolve to 1 as 0
+         depending on what the feed's raw direction_id says. Hardcoding
+         "similar bearing -> 0" used to silently flip every pattern that
+         needed the geometric fallback whenever the reference pattern's
+         raw direction happened to be 1, which misbucketed rare/messy
+         patterns into the wrong direction (or duplicated a direction's
+         primary while leaving another pattern orphaned).
       3. A genuine loop (first stop == last stop) with nothing to compare
-         bearings against is the route's single direction - 0.
+         bearings against shares the reference pattern's direction.
     """
     if raw_directions == {0} or raw_directions == {1}:
         return next(iter(raw_directions))
 
     if pattern == reference_pattern:
-        return 0
+        return reference_direction
 
     if pattern[0] == pattern[-1]:
-        return 0
+        return reference_direction
 
     bearing = _pattern_bearing(pattern, stops_by_id)
     if bearing is None or reference_bearing is None:
-        return 1
+        return 1 - reference_direction
 
-    return 1 if _angle_diff(bearing, reference_bearing) > 90.0 else 0
+    if _angle_diff(bearing, reference_bearing) > 90.0:
+        return 1 - reference_direction
+    return reference_direction
 
 
 def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
@@ -222,6 +234,19 @@ def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
     reference_pattern = max(patterns, key=lambda p: len(patterns[p]))
     reference_bearing = _pattern_bearing(reference_pattern, stops_by_id)
 
+    # The reference pattern's OWN direction, decided the same way as any
+    # other pattern's priority-1 case: trust its raw GTFS direction_id if
+    # every trip sharing it agrees, otherwise default to 0. Every other
+    # pattern that needs the geometric fallback in _assign_direction is
+    # bucketed relative to THIS value, not a hardcoded 0.
+    reference_raw_directions = {trip_to_direction.get(tid) for tid in patterns[reference_pattern]}
+    reference_raw_directions.discard(None)
+    reference_direction = (
+        next(iter(reference_raw_directions))
+        if reference_raw_directions in ({0}, {1})
+        else 0
+    )
+
     variants = []
     for index, (pattern, trip_ids_in_pattern) in enumerate(
         sorted(patterns.items(), key=lambda kv: -len(kv[1]))
@@ -230,7 +255,8 @@ def build_route_variants(route_id, trip_ids, trip_to_direction, trip_stops,
         raw_directions.discard(None)
 
         direction_id = _assign_direction(
-            pattern, reference_pattern, reference_bearing, raw_directions, stops_by_id
+            pattern, reference_pattern, reference_bearing, reference_direction,
+            raw_directions, stops_by_id
         )
 
         shape_id = _mode(
