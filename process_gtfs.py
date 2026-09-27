@@ -43,9 +43,34 @@ def _angle_diff(a, b):
 def _pattern_bearing(pattern, stops_by_id):
     start = _stop_latlon(stops_by_id, pattern[0])
     end = _stop_latlon(stops_by_id, pattern[-1])
-    if not start or not end or start == end:
+    if start and end and start != end:
+        return _bearing(start[0], start[1], end[0], end[1])
+
+    # The pattern starts and ends at the same terminal (e.g. a non-circular
+    # route that loops back to its depot - NOT a genuine circular line,
+    # those are already short-circuited earlier in _assign_direction before
+    # this function is ever called on them). Previously this fell through
+    # to `return None`, which broke direction assignment for every OTHER
+    # pattern on the same route whenever this pattern was chosen as the
+    # route's reference pattern (the one with the most trips): with
+    # reference_bearing == None, _assign_direction's fallback
+    # ("if bearing is None or reference_bearing is None: return 1")
+    # dumped every other pattern into direction=1 with no real geographic
+    # comparison, regardless of which way it actually ran. That silently
+    # picked the wrong primary variant for direction 1 whenever a route
+    # had more than two patterns, and is why non-circular routes with a
+    # shared start/end terminal displayed the wrong path.
+    #
+    # Fall back to the bearing toward the pattern's midpoint stop instead,
+    # which is still geographically meaningful even when the endpoints
+    # coincide.
+    if not start:
         return None
-    return _bearing(start[0], start[1], end[0], end[1])
+    mid_index = len(pattern) // 2
+    mid = _stop_latlon(stops_by_id, pattern[mid_index])
+    if not mid or mid == start:
+        return None
+    return _bearing(start[0], start[1], mid[0], mid[1])
 
 
 def _mode(values):
